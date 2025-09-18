@@ -109,24 +109,42 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(files: &mut [(R, usize
 
             let track_desc = desc.moov_tracks.get_mut(tl_track).unwrap();
             if typ == fourcc("elst") {
-                // Write edit list with gaps
-                output_file.write_u32::<BigEndian>(track_desc.elst_entries.len() as u32)?;
-                new_size += 4;
-                
-                log::debug!("Writing elst with {} entries for track {}", track_desc.elst_entries.len(), tl_track);
-                
-                for entry in &track_desc.elst_entries {
-                    // For simplicity, we'll write version 1 (64-bit) elst entries
-                    output_file.write_u64::<BigEndian>(entry.segment_duration)?;
-                    output_file.write_i64::<BigEndian>(entry.media_time)?;
-                    output_file.write_u32::<BigEndian>(entry.media_rate)?;
-                    new_size += 20; // 8 + 8 + 4 bytes per entry
+                // Write edit list with gaps if available, otherwise use default
+                if !track_desc.elst_entries.is_empty() {
+                    output_file.write_u32::<BigEndian>(track_desc.elst_entries.len() as u32)?;
+                    new_size += 4;
                     
-                    if entry.media_time == -1 {
-                        log::debug!("  Gap entry: duration={} (movie timescale)", entry.segment_duration);
-                    } else {
-                        log::debug!("  Media entry: duration={}, media_time={}", entry.segment_duration, entry.media_time);
+                    log::debug!("Writing elst with {} entries for track {}", track_desc.elst_entries.len(), tl_track);
+                    
+                    for entry in &track_desc.elst_entries {
+                        // For simplicity, we'll write version 1 (64-bit) elst entries
+                        output_file.write_u64::<BigEndian>(entry.segment_duration)?;
+                        output_file.write_i64::<BigEndian>(entry.media_time)?;
+                        output_file.write_u32::<BigEndian>(entry.media_rate)?;
+                        new_size += 20; // 8 + 8 + 4 bytes per entry
+                        
+                        if entry.media_time == -1 {
+                            log::debug!("  Gap entry: duration={} (movie timescale)", entry.segment_duration);
+                        } else {
+                            log::debug!("  Media entry: duration={}, media_time={}", entry.segment_duration, entry.media_time);
+                        }
                     }
+                } else {
+                    // Fallback to single entry edit list (original behavior)
+                    output_file.write_u32::<BigEndian>(1)?; // entry_count = 1
+                    new_size += 4;
+                    
+                    let mut elst_duration = track_desc.elst_segment_duration;
+                    if elst_duration == 0 || track_desc.mdhd_duration > elst_duration {
+                        elst_duration = track_desc.mdhd_duration;
+                    }
+                    
+                    output_file.write_u64::<BigEndian>(elst_duration)?;
+                    output_file.write_i64::<BigEndian>(0)?; // media_time = 0
+                    output_file.write_u32::<BigEndian>(0x00010000)?; // media_rate = 1.0
+                    new_size += 20;
+                    
+                    log::debug!("Writing default elst entry: duration={}", elst_duration);
                 }
             }
             if typ == fourcc("stts") {

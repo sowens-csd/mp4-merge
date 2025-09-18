@@ -130,6 +130,7 @@ pub fn join_file_streams_with_metadata<F: Fn(f64), I: Read + Seek, O: Read + Wri
                 if let Some(first_track) = desc.moov_tracks.get(0) {
                     if first_track.mdhd_timescale > 0 && first_track.mdhd_duration > 0 {
                         desc.file_durations[i] = first_track.mdhd_duration as f64 / first_track.mdhd_timescale as f64;
+                        log::debug!("File {} duration: {:.2}s", i, desc.file_durations[i]);
                     }
                 }
             }

@@ -171,11 +171,27 @@ pub fn read_desc<R: Read + Seek>(d: &mut R, desc: &mut Desc, track: usize, max_r
 pub fn compute_gaps_and_edit_lists(desc: &mut Desc) -> Result<()> {
     log::debug!("Computing gaps and edit lists for {} files", desc.file_creation_times.len());
     
+    // Check if we have enough timestamps to compute gaps
+    let has_timestamps = desc.file_creation_times.iter().any(|t| t.is_some());
+    
+    if !has_timestamps {
+        log::debug!("No timestamps available, skipping gap computation");
+        return Ok(());
+    }
+    
     // First, compute all gaps 
     let mut gaps = Vec::new();
     for file_index in 1..desc.file_creation_times.len() {
         let gap_duration = compute_gap_duration(&desc, file_index - 1, file_index);
         gaps.push(gap_duration);
+    }
+    
+    // Check if there are any meaningful gaps
+    let has_gaps = gaps.iter().any(|&gap| gap > 0.0);
+    
+    if !has_gaps {
+        log::debug!("No gaps detected, using default edit list behavior");
+        return Ok(());
     }
     
     // For each track, create edit list entries including gaps
@@ -223,6 +239,16 @@ pub fn compute_gaps_and_edit_lists(desc: &mut Desc) -> Result<()> {
         track.elst_segment_duration = track.elst_entries.iter()
             .map(|entry| entry.segment_duration)
             .sum();
+            
+        // Update track duration to include gaps
+        track.tkhd_duration = track.elst_segment_duration;
+    }
+    
+    // Update the movie header duration to include gaps
+    if let Some(first_track) = desc.moov_tracks.get(0) {
+        if !first_track.skip && !first_track.elst_entries.is_empty() {
+            desc.moov_mvhd_duration = first_track.elst_segment_duration;
+        }
     }
     
     Ok(())
@@ -238,10 +264,15 @@ fn compute_gap_duration(desc: &Desc, prev_file_index: usize, current_file_index:
             let prev_duration = desc.file_durations[prev_file_index];
             let gap_seconds = gap.as_secs_f64();
             
+            log::debug!("File {} ended at {:.2}s after creation", prev_file_index, prev_duration);
+            log::debug!("File {} created {:.2}s after file {}", current_file_index, gap_seconds, prev_file_index);
+            
             // The actual gap is the time difference minus the duration of the previous file
             let net_gap = gap_seconds - prev_duration;
             
-            // Only consider it a gap if it's more than 1 second
+            log::debug!("Net gap: {:.2}s", net_gap);
+            
+            // Only consider it a gap if it's more than 1 second to avoid false positives
             if net_gap > 1.0 {
                 return net_gap;
             }
