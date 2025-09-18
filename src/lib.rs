@@ -54,18 +54,39 @@ pub fn read_box<R: Read + Seek>(reader: &mut R) -> Result<(u32, u64, u64, i64)> 
 
 pub fn join_files<P: AsRef<Path>, F: Fn(f64)>(files: &[P], output_file: &P, progress_cb: F) -> Result<()> {
     let mut open_files = Vec::with_capacity(files.len());
+    let mut file_metadata = Vec::with_capacity(files.len());
+    
     for x in files {
         let f = std::fs::File::open(x)?;
-        let size = f.metadata()?.len() as usize;
+        let metadata = f.metadata()?;
+        let size = metadata.len() as usize;
+        
+        // Extract creation time from file metadata
+        let creation_time = filetime_creation::FileTime::from_creation_time(&metadata)
+            .and_then(|ft| {
+                // Convert FileTime to SystemTime
+                std::time::SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(ft.seconds() as u64))
+            });
+        
         open_files.push((f, size));
+        file_metadata.push(creation_time);
     }
-    join_file_streams(&mut open_files, std::fs::File::create(output_file)?, progress_cb)
+    
+    join_file_streams_with_metadata(&mut open_files, std::fs::File::create(output_file)?, &file_metadata, progress_cb)
 }
 
 pub fn join_file_streams<F: Fn(f64), I: Read + Seek, O: Read + Write + Seek>(files: &mut [(I, usize)], output_file: O, progress_cb: F) -> Result<()> {
+    // For backwards compatibility, call with empty metadata
+    let empty_metadata = vec![None; files.len()];
+    join_file_streams_with_metadata(files, output_file, &empty_metadata, progress_cb)
+}
+
+pub fn join_file_streams_with_metadata<F: Fn(f64), I: Read + Seek, O: Read + Write + Seek>(files: &mut [(I, usize)], output_file: O, file_metadata: &[Option<std::time::SystemTime>], progress_cb: F) -> Result<()> {
     // Get the merged description from all source files
     let mut desc = desc_reader::Desc::default();
     desc.moov_tracks.resize(10, Default::default());
+    desc.file_creation_times = file_metadata.to_vec();
+    desc.file_durations.resize(files.len(), 0.0);
     let mut total_size = 0;
     let num_files = files.len() as f64;
     let mut insta360_max_read = None;
@@ -101,6 +122,20 @@ pub fn join_file_streams<F: Fn(f64), I: Read + Seek, O: Read + Write + Seek>(fil
 
         desc_reader::read_desc(&mut fs, &mut desc, 0, u64::MAX, i)?;
 
+        // Store file duration in seconds
+        if desc.moov_mvhd_timescale > 0 {
+            let file_duration_in_movie_timescale = *desc.mvhd_timescale_per_file.get(i).unwrap_or(&desc.moov_mvhd_timescale);
+            if file_duration_in_movie_timescale > 0 {
+                // Calculate duration based on the first track (assuming all tracks have similar duration)
+                if let Some(first_track) = desc.moov_tracks.get(0) {
+                    if first_track.mdhd_timescale > 0 && first_track.mdhd_duration > 0 {
+                        desc.file_durations[i] = first_track.mdhd_duration as f64 / first_track.mdhd_timescale as f64;
+                        log::debug!("File {} duration: {:.2}s", i, desc.file_durations[i]);
+                    }
+                }
+            }
+        }
+
         if let Some(mdat) = desc.mdat_position.last_mut() {
             mdat.0 = Some(i);
             desc.mdat_offset += mdat.2;
@@ -112,6 +147,9 @@ pub fn join_file_streams<F: Fn(f64), I: Read + Seek, O: Read + Write + Seek>(fil
 
         progress_cb(((i as f64 + 1.0) / num_files) * 0.1);
     }
+
+    // Compute gaps between files and create edit list entries
+    desc_reader::compute_gaps_and_edit_lists(&mut desc)?;
 
     // Write it to the file
     let mut debounce = Instant::now();

@@ -23,6 +23,24 @@ pub struct TrackDesc {
     pub stsc: Vec<(u32, u32, u32)>, // first_chunk, samples_per_chunk, sample_description_index
     pub co64_final_position: u64,
     pub skip: bool,
+    pub elst_entries: Vec<EditListEntry>, // Edit list entries including gaps
+}
+
+#[derive(Clone, Debug)]
+pub struct EditListEntry {
+    pub segment_duration: u64, // Duration in movie timescale
+    pub media_time: i64,       // Media time (-1 for gaps)
+    pub media_rate: u32,       // Typically 0x00010000
+}
+
+impl Default for EditListEntry {
+    fn default() -> Self {
+        Self {
+            segment_duration: 0,
+            media_time: 0,
+            media_rate: 0x00010000,
+        }
+    }
 }
 
 #[derive(Default, Clone, Debug)]
@@ -34,6 +52,8 @@ pub struct Desc {
     pub moov_tracks: Vec<TrackDesc>,
     pub mdat_offset: u64,
     pub mdat_final_position: u64,
+    pub file_creation_times: Vec<Option<std::time::SystemTime>>, // Creation time of each file
+    pub file_durations: Vec<f64>, // Duration of each file in seconds
 }
 
 pub fn read_desc<R: Read + Seek>(d: &mut R, desc: &mut Desc, track: usize, max_read: u64, file_index: usize) -> Result<()> {
@@ -146,4 +166,118 @@ pub fn read_desc<R: Read + Seek>(d: &mut R, desc: &mut Desc, track: usize, max_r
         }
     }
     Ok(())
+}
+
+pub fn compute_gaps_and_edit_lists(desc: &mut Desc) -> Result<()> {
+    log::debug!("Computing gaps and edit lists for {} files", desc.file_creation_times.len());
+    
+    // Check if we have enough timestamps to compute gaps
+    let has_timestamps = desc.file_creation_times.iter().any(|t| t.is_some());
+    
+    if !has_timestamps {
+        log::debug!("No timestamps available, skipping gap computation");
+        return Ok(());
+    }
+    
+    // First, compute all gaps 
+    let mut gaps = Vec::new();
+    for file_index in 1..desc.file_creation_times.len() {
+        let gap_duration = compute_gap_duration(&desc, file_index - 1, file_index);
+        gaps.push(gap_duration);
+    }
+    
+    // Check if there are any meaningful gaps
+    let has_gaps = gaps.iter().any(|&gap| gap > 0.0);
+    
+    if !has_gaps {
+        log::debug!("No gaps detected, using default edit list behavior");
+        return Ok(());
+    }
+    
+    // For each track, create edit list entries including gaps
+    for track_index in 0..desc.moov_tracks.len() {
+        let track = &mut desc.moov_tracks[track_index];
+        if track.skip {
+            continue;
+        }
+        
+        track.elst_entries.clear();
+        let mut cumulative_media_time = 0i64;
+        
+        for file_index in 0..desc.file_creation_times.len() {
+            // Add gap before this file (except for the first file)
+            if file_index > 0 {
+                let gap_duration = gaps[file_index - 1];
+                if gap_duration > 0.0 {
+                    let gap_duration_timescale = (gap_duration * desc.moov_mvhd_timescale as f64).round() as u64;
+                    track.elst_entries.push(EditListEntry {
+                        segment_duration: gap_duration_timescale,
+                        media_time: -1, // -1 indicates a gap/pause
+                        media_rate: 0x00010000,
+                    });
+                    log::debug!("Added gap of {:.2}s between files {} and {}", gap_duration, file_index - 1, file_index);
+                }
+            }
+            
+            // Add the actual media segment for this file
+            if desc.file_durations[file_index] > 0.0 {
+                let file_duration_timescale = (desc.file_durations[file_index] * desc.moov_mvhd_timescale as f64).round() as u64;
+                track.elst_entries.push(EditListEntry {
+                    segment_duration: file_duration_timescale,
+                    media_time: cumulative_media_time,
+                    media_rate: 0x00010000,
+                });
+                
+                // Convert file duration to media timescale for next media_time
+                if track.mdhd_timescale > 0 {
+                    cumulative_media_time += (desc.file_durations[file_index] * track.mdhd_timescale as f64).round() as i64;
+                }
+            }
+        }
+        
+        // Update total elst_segment_duration to include gaps
+        track.elst_segment_duration = track.elst_entries.iter()
+            .map(|entry| entry.segment_duration)
+            .sum();
+            
+        // Update track duration to include gaps
+        track.tkhd_duration = track.elst_segment_duration;
+    }
+    
+    // Update the movie header duration to include gaps
+    if let Some(first_track) = desc.moov_tracks.get(0) {
+        if !first_track.skip && !first_track.elst_entries.is_empty() {
+            desc.moov_mvhd_duration = first_track.elst_segment_duration;
+        }
+    }
+    
+    Ok(())
+}
+
+fn compute_gap_duration(desc: &Desc, prev_file_index: usize, current_file_index: usize) -> f64 {
+    // Try to compute gap based on file creation times
+    if let (Some(prev_time), Some(current_time)) = (
+        desc.file_creation_times[prev_file_index],
+        desc.file_creation_times[current_file_index]
+    ) {
+        if let Ok(gap) = current_time.duration_since(prev_time) {
+            let prev_duration = desc.file_durations[prev_file_index];
+            let gap_seconds = gap.as_secs_f64();
+            
+            log::debug!("File {} ended at {:.2}s after creation", prev_file_index, prev_duration);
+            log::debug!("File {} created {:.2}s after file {}", current_file_index, gap_seconds, prev_file_index);
+            
+            // The actual gap is the time difference minus the duration of the previous file
+            let net_gap = gap_seconds - prev_duration;
+            
+            log::debug!("Net gap: {:.2}s", net_gap);
+            
+            // Only consider it a gap if it's more than 1 second to avoid false positives
+            if net_gap > 1.0 {
+                return net_gap;
+            }
+        }
+    }
+    
+    0.0
 }
