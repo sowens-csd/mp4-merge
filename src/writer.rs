@@ -60,7 +60,7 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(files: &mut [(R, usize
 
             get_first(files).seek(SeekFrom::Current(size as i64 - header_size))?;
 
-        } else if typ == fourcc("mvhd") || typ == fourcc("tkhd") || typ == fourcc("mdhd") || typ == fourcc("elst") {
+        } else if typ == fourcc("mvhd") || typ == fourcc("tkhd") || typ == fourcc("mdhd") {
             log::debug!("Writing {} with patched duration, offset: {}, size: {size}", typ_to_str(typ), offs);
             let d = get_first(files);
 
@@ -85,18 +85,9 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(files: &mut [(R, usize
                     if v == 1 { patch_bytes(output_file, pos+8+8+4, &track_desc.mdhd_duration.to_be_bytes())?; }
                     else      { patch_bytes(output_file, pos+4+4+4, &(track_desc.mdhd_duration as u32).to_be_bytes())?; }
                 }
-                if typ == fourcc("elst") {
-                    let mut elst_duration = track_desc.elst_segment_duration;
-                    if elst_duration != 0 && track_desc.mdhd_duration > elst_duration {
-                        elst_duration = track_desc.mdhd_duration;
-                    }
-
-                    if v == 1 { patch_bytes(output_file, pos+4, &elst_duration.to_be_bytes())?; }
-                    else      { patch_bytes(output_file, pos+4, &(elst_duration as u32).to_be_bytes())?; }
-                }
             }
 
-        } else if typ == fourcc("stts") || typ == fourcc("stsz") || typ == fourcc("stss") || typ == fourcc("stco") || typ == fourcc("co64") || typ == fourcc("sdtp") || typ == fourcc("stsc") {
+        } else if typ == fourcc("elst") || typ == fourcc("stts") || typ == fourcc("stsz") || typ == fourcc("stss") || typ == fourcc("stco") || typ == fourcc("co64") || typ == fourcc("sdtp") || typ == fourcc("stsc") {
             log::debug!("Writing new {}, offset: {}, size: {size}", typ_to_str(typ), offs);
 
             get_first(files).seek(SeekFrom::Current(size as i64 - header_size))?;
@@ -106,9 +97,38 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(files: &mut [(R, usize
             output_file.write_all(&0u32.to_be_bytes())?;
             let new_typ = if typ == fourcc("stco") { fourcc("co64") } else { typ };
             output_file.write_all(&new_typ.to_be_bytes())?;
-            output_file.write_all(&0u32.to_be_bytes())?; // flags
+            
+            // Write version and flags (special handling for elst)
+            if typ == fourcc("elst") {
+                output_file.write_u8(1)?; // Version 1 for 64-bit entries
+                output_file.write_u24::<BigEndian>(0)?; // flags
+                new_size += 4;
+            } else {
+                output_file.write_all(&0u32.to_be_bytes())?; // flags
+            }
 
             let track_desc = desc.moov_tracks.get_mut(tl_track).unwrap();
+            if typ == fourcc("elst") {
+                // Write edit list with gaps
+                output_file.write_u32::<BigEndian>(track_desc.elst_entries.len() as u32)?;
+                new_size += 4;
+                
+                log::debug!("Writing elst with {} entries for track {}", track_desc.elst_entries.len(), tl_track);
+                
+                for entry in &track_desc.elst_entries {
+                    // For simplicity, we'll write version 1 (64-bit) elst entries
+                    output_file.write_u64::<BigEndian>(entry.segment_duration)?;
+                    output_file.write_i64::<BigEndian>(entry.media_time)?;
+                    output_file.write_u32::<BigEndian>(entry.media_rate)?;
+                    new_size += 20; // 8 + 8 + 4 bytes per entry
+                    
+                    if entry.media_time == -1 {
+                        log::debug!("  Gap entry: duration={} (movie timescale)", entry.segment_duration);
+                    } else {
+                        log::debug!("  Media entry: duration={}, media_time={}", entry.segment_duration, entry.media_time);
+                    }
+                }
+            }
             if typ == fourcc("stts") {
                 let mut new_stts: Vec<(u32, u32)> = Vec::with_capacity(track_desc.stts.len());
                 let mut prev_delta = None;
