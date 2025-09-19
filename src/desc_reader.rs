@@ -240,8 +240,15 @@ pub fn compute_gaps_and_edit_lists(desc: &mut Desc) -> Result<()> {
             .map(|entry| entry.segment_duration)
             .sum();
             
-        // Update track duration to include gaps
-        track.tkhd_duration = track.elst_segment_duration;
+        // Fix: Convert tkhd_duration from movie timescale to media timescale
+        // tkhd_duration must be in the track's media timescale (mdhd), but elst_segment_duration is in movie (mvhd) timescale
+        if desc.moov_mvhd_timescale > 0 && track.mdhd_timescale > 0 {
+            let total_duration_seconds = track.elst_segment_duration as f64 / desc.moov_mvhd_timescale as f64;
+            track.tkhd_duration = (total_duration_seconds * track.mdhd_timescale as f64).round() as u64;
+        } else {
+            // Fallback to direct assignment if timescales are not available
+            track.tkhd_duration = track.elst_segment_duration;
+        }
     }
     
     // Update the movie header duration to include gaps
@@ -280,4 +287,101 @@ fn compute_gap_duration(desc: &Desc, prev_file_index: usize, current_file_index:
     }
     
     0.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, Duration};
+
+    #[test]
+    fn test_tkhd_duration_timescale_conversion_with_gaps() {
+        let mut desc = Desc {
+            moov_mvhd_timescale: 1000, // Movie timescale: 1000 units per second
+            // Set up file creation times with a gap
+            file_creation_times: vec![
+                Some(SystemTime::UNIX_EPOCH), 
+                Some(SystemTime::UNIX_EPOCH + Duration::from_secs(5)) // 5 second gap after 2s file = 3s net gap
+            ],
+            file_durations: vec![2.0, 3.0], // 2s and 3s files
+            ..Default::default()
+        };
+        
+        let track = TrackDesc {
+            mdhd_timescale: 48000, // Media timescale: 48000 units per second  
+            ..Default::default()
+        };
+        
+        desc.moov_tracks.push(track);
+        
+        // Call the function that should fix the timescale - this will detect gaps and process them
+        compute_gaps_and_edit_lists(&mut desc).unwrap();
+        
+        let fixed_track = &desc.moov_tracks[0];
+        
+        // Should have created edit list entries
+        assert!(!fixed_track.elst_entries.is_empty());
+        
+        // Total duration in movie timescale should be: 2s + 3s gap + 3s = 8s = 8000 units
+        assert_eq!(fixed_track.elst_segment_duration, 8000);
+        
+        // tkhd_duration should be converted to media timescale: 8s * 48000 units/s = 384000 units
+        assert_eq!(fixed_track.tkhd_duration, 384000);
+    }
+    
+    #[test]
+    fn test_tkhd_duration_conversion_edge_cases() {
+        let mut desc = Desc {
+            moov_mvhd_timescale: 1000,
+            file_creation_times: vec![
+                Some(SystemTime::UNIX_EPOCH), 
+                Some(SystemTime::UNIX_EPOCH + Duration::from_secs(4)) // 4 second gap after 1s file = 3s net gap
+            ],
+            file_durations: vec![1.0, 1.0],
+            ..Default::default()
+        };
+        
+        let track = TrackDesc {
+            mdhd_timescale: 30000, // Different timescale
+            ..Default::default()
+        };
+        
+        desc.moov_tracks.push(track);
+        
+        compute_gaps_and_edit_lists(&mut desc).unwrap();
+        
+        let fixed_track = &desc.moov_tracks[0];
+        
+        // Total: 1s + 3s gap + 1s = 5s = 5000 units in movie timescale
+        assert_eq!(fixed_track.elst_segment_duration, 5000);
+        
+        // In media timescale: 5s * 30000 = 150000 units  
+        assert_eq!(fixed_track.tkhd_duration, 150000);
+    }
+    
+    #[test]
+    fn test_tkhd_duration_no_gaps_no_change() {
+        let mut desc = Desc {
+            moov_mvhd_timescale: 1000,
+            file_creation_times: vec![None, None], // No timestamps = no gaps
+            file_durations: vec![2.0, 3.0],
+            ..Default::default()
+        };
+        
+        let track = TrackDesc {
+            mdhd_timescale: 48000,
+            tkhd_duration: 12345, // Some initial value
+            ..Default::default()
+        };
+        
+        desc.moov_tracks.push(track);
+        
+        compute_gaps_and_edit_lists(&mut desc).unwrap();
+        
+        let fixed_track = &desc.moov_tracks[0];
+        
+        // Should remain unchanged since no gaps detected
+        assert_eq!(fixed_track.tkhd_duration, 12345);
+        assert!(fixed_track.elst_entries.is_empty());
+    }
 }
