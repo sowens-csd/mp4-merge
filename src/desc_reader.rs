@@ -24,6 +24,7 @@ pub struct TrackDesc {
     pub co64_final_position: u64,
     pub skip: bool,
     pub elst_entries: Vec<EditListEntry>, // Edit list entries including gaps
+    pub handler_type: String, // Track handler type (e.g., "vide", "soun", "meta", etc.)
 }
 
 #[derive(Clone, Debug)]
@@ -159,6 +160,15 @@ pub fn read_desc<R: Read + Seek>(d: &mut R, desc: &mut Desc, track: usize, max_r
                 let track_desc = desc.moov_tracks.get_mut(tl_track).unwrap();
                 track_desc.skip = true;
             }
+            if typ == fourcc("hdlr") {
+                // Read handler type to identify track type (video, audio, metadata, etc.)
+                let track_desc = desc.moov_tracks.get_mut(tl_track).unwrap();
+                let (_v, _flags) = (d.read_u8()?, d.read_u24::<BigEndian>()?);
+                d.seek(SeekFrom::Current(4))?; // Skip pre_defined
+                let handler_type = d.read_u32::<BigEndian>()?;
+                track_desc.handler_type = typ_to_str(handler_type);
+                log::debug!("Track {} handler type: {}", tl_track, track_desc.handler_type);
+            }
             d.seek(SeekFrom::Start(org_pos + size - header_size as u64))?;
         }
         if d.stream_position()? - start_offs >= max_read {
@@ -197,6 +207,11 @@ pub fn compute_gaps_and_edit_lists(desc: &mut Desc) -> Result<()> {
     // For each track, create edit list entries including gaps
     for track_index in 0..desc.moov_tracks.len() {
         let track = &mut desc.moov_tracks[track_index];
+        
+        // Add debug logging for track handler types to aid identification
+        log::debug!("Processing track {} with handler type: '{}' (skip: {})", 
+                   track_index, track.handler_type, track.skip);
+        
         if track.skip {
             continue;
         }
@@ -383,5 +398,69 @@ mod tests {
         // Should remain unchanged since no gaps detected
         assert_eq!(fixed_track.tkhd_duration, 12345);
         assert!(fixed_track.elst_entries.is_empty());
+    }
+
+    #[test]
+    fn test_gps_metadata_track_elst_generation() {
+        let mut desc = Desc {
+            moov_mvhd_timescale: 1000, // Movie timescale: 1000 units per second
+            // Set up file creation times with a gap to test ELST generation
+            file_creation_times: vec![
+                Some(SystemTime::UNIX_EPOCH), 
+                Some(SystemTime::UNIX_EPOCH + Duration::from_secs(4)) // 4 second gap after 1s file = 3s net gap
+            ],
+            file_durations: vec![1.0, 2.0], // 1s and 2s files
+            ..Default::default()
+        };
+        
+        // Create a video track
+        let video_track = TrackDesc {
+            mdhd_timescale: 30000, // Video timescale
+            handler_type: "vide".to_string(),
+            ..Default::default()
+        };
+        
+        // Create a GPS metadata track 
+        let gps_track = TrackDesc {
+            mdhd_timescale: 1000, // GPS metadata timescale
+            handler_type: "meta".to_string(),
+            ..Default::default()
+        };
+        
+        desc.moov_tracks.push(video_track);
+        desc.moov_tracks.push(gps_track);
+        
+        // Process gaps and edit lists
+        compute_gaps_and_edit_lists(&mut desc).unwrap();
+        
+        let video_track = &desc.moov_tracks[0];
+        let gps_track = &desc.moov_tracks[1];
+        
+        // Both tracks should have edit list entries
+        assert!(!video_track.elst_entries.is_empty(), "Video track should have ELST entries");
+        assert!(!gps_track.elst_entries.is_empty(), "GPS metadata track should have ELST entries");
+        
+        // Both tracks should have the same total duration in movie timescale
+        // Total: 1s + 3s gap + 2s = 6s = 6000 units in movie timescale
+        assert_eq!(video_track.elst_segment_duration, 6000);
+        assert_eq!(gps_track.elst_segment_duration, 6000);
+        
+        // Both tracks should have 3 entries: media1, gap, media2
+        assert_eq!(video_track.elst_entries.len(), 3);
+        assert_eq!(gps_track.elst_entries.len(), 3);
+        
+        // Check GPS track entries specifically
+        assert_eq!(gps_track.elst_entries[0].segment_duration, 1000); // 1s file
+        assert_eq!(gps_track.elst_entries[0].media_time, 0); // Start at 0
+        
+        assert_eq!(gps_track.elst_entries[1].segment_duration, 3000); // 3s gap
+        assert_eq!(gps_track.elst_entries[1].media_time, -1); // Gap entry
+        
+        assert_eq!(gps_track.elst_entries[2].segment_duration, 2000); // 2s file
+        assert_eq!(gps_track.elst_entries[2].media_time, 1000); // 1s offset in GPS timescale
+        
+        // Check that tkhd_duration is properly converted to media timescale for GPS track
+        // 6s * 1000 GPS timescale = 6000 units
+        assert_eq!(gps_track.tkhd_duration, 6000);
     }
 }
