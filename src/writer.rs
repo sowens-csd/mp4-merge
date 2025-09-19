@@ -102,7 +102,7 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(files: &mut [(R, usize
             if typ == fourcc("elst") {
                 output_file.write_u8(1)?; // Version 1 for 64-bit entries
                 output_file.write_u24::<BigEndian>(0)?; // flags
-                new_size += 4;
+                // Note: new_size already includes the 4 bytes for version/flags in the initial value
             } else {
                 output_file.write_all(&0u32.to_be_bytes())?; // flags
             }
@@ -114,7 +114,7 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(files: &mut [(R, usize
                     output_file.write_u32::<BigEndian>(track_desc.elst_entries.len() as u32)?;
                     new_size += 4;
                     
-                    log::debug!("Writing elst with {} entries for track {}", track_desc.elst_entries.len(), tl_track);
+                    log::debug!("Writing ELST v1 with {} entries for track {} (multi-entry path)", track_desc.elst_entries.len(), tl_track);
                     
                     for entry in &track_desc.elst_entries {
                         // For simplicity, we'll write version 1 (64-bit) elst entries
@@ -144,8 +144,12 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(files: &mut [(R, usize
                     output_file.write_u32::<BigEndian>(0x00010000)?; // media_rate = 1.0
                     new_size += 20;
                     
-                    log::debug!("Writing default elst entry: duration={}", elst_duration);
+                    log::debug!("Writing ELST v1 default single entry: duration={} (fallback path)", elst_duration);
                 }
+                
+                // Debug: Show final ELST size calculation
+                log::debug!("ELST v1 atom total size: {} bytes (header: 12, entry_count: 4, entry_data: {})", 
+                    new_size, new_size - 16);
             }
             if typ == fourcc("stts") {
                 let mut new_stts: Vec<(u32, u32)> = Vec::with_capacity(track_desc.stts.len());
