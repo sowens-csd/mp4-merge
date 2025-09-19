@@ -54,7 +54,8 @@ pub struct Desc {
     pub mdat_offset: u64,
     pub mdat_final_position: u64,
     pub file_creation_times: Vec<Option<std::time::SystemTime>>, // Creation time of each file
-    pub file_durations: Vec<f64>, // Duration of each file in seconds
+    pub file_durations: Vec<f64>, // Duration of each file in seconds (legacy, from first track)
+    pub track_file_durations: Vec<Vec<f64>>, // track_file_durations[track_index][file_index] = duration in seconds
 }
 
 pub fn read_desc<R: Read + Seek>(d: &mut R, desc: &mut Desc, track: usize, max_read: u64, file_index: usize) -> Result<()> {
@@ -105,6 +106,13 @@ pub fn read_desc<R: Read + Seek>(d: &mut R, desc: &mut Desc, track: usize, max_r
                         }
                         let add_duration = ((duration as f64 / timescale as f64) * track_desc.mdhd_timescale as f64).ceil() as u64;
                         track_desc.mdhd_duration += add_duration;
+                        
+                        // Store per-track, per-file duration in seconds
+                        if tl_track < desc.track_file_durations.len() && file_index < desc.track_file_durations[tl_track].len() {
+                            let duration_seconds = duration as f64 / timescale as f64;
+                            desc.track_file_durations[tl_track][file_index] = duration_seconds;
+                            log::debug!("Track {} file {} duration: {:.2}s", tl_track, file_index, duration_seconds);
+                        }
                     }
                 }
             }
@@ -235,8 +243,16 @@ pub fn compute_gaps_and_edit_lists(desc: &mut Desc) -> Result<()> {
             }
             
             // Add the actual media segment for this file
-            if desc.file_durations[file_index] > 0.0 {
-                let file_duration_timescale = (desc.file_durations[file_index] * desc.moov_mvhd_timescale as f64).round() as u64;
+            let track_file_duration = if track_index < desc.track_file_durations.len() 
+                && file_index < desc.track_file_durations[track_index].len() {
+                desc.track_file_durations[track_index][file_index]
+            } else {
+                // Fallback to global file duration for backward compatibility
+                desc.file_durations.get(file_index).copied().unwrap_or(0.0)
+            };
+            
+            if track_file_duration > 0.0 {
+                let file_duration_timescale = (track_file_duration * desc.moov_mvhd_timescale as f64).round() as u64;
                 track.elst_entries.push(EditListEntry {
                     segment_duration: file_duration_timescale,
                     media_time: cumulative_media_time,
@@ -245,7 +261,7 @@ pub fn compute_gaps_and_edit_lists(desc: &mut Desc) -> Result<()> {
                 
                 // Convert file duration to media timescale for next media_time
                 if track.mdhd_timescale > 0 {
-                    cumulative_media_time += (desc.file_durations[file_index] * track.mdhd_timescale as f64).round() as i64;
+                    cumulative_media_time += (track_file_duration * track.mdhd_timescale as f64).round() as i64;
                 }
             }
         }
@@ -398,6 +414,67 @@ mod tests {
         // Should remain unchanged since no gaps detected
         assert_eq!(fixed_track.tkhd_duration, 12345);
         assert!(fixed_track.elst_entries.is_empty());
+    }
+
+    #[test]
+    fn test_per_track_duration_calculation() {
+        let mut desc = Desc {
+            moov_mvhd_timescale: 1000, // Movie timescale: 1000 units per second
+            file_creation_times: vec![
+                Some(SystemTime::UNIX_EPOCH), 
+                Some(SystemTime::UNIX_EPOCH + Duration::from_secs(6)) // 6 second gap after 2s file = 4s net gap
+            ],
+            file_durations: vec![2.0, 3.0], // Global durations from first track
+            track_file_durations: vec![
+                vec![2.0, 3.0], // Video track: 2s and 3s files  
+                vec![1.5, 2.5], // GPS track: 1.5s and 2.5s files (different durations)
+            ],
+            ..Default::default()
+        };
+        
+        // Create a video track
+        let video_track = TrackDesc {
+            mdhd_timescale: 30000, // Video timescale
+            handler_type: "vide".to_string(),
+            ..Default::default()
+        };
+        
+        // Create a GPS metadata track with different durations
+        let gps_track = TrackDesc {
+            mdhd_timescale: 1000, // GPS metadata timescale
+            handler_type: "meta".to_string(),
+            ..Default::default()
+        };
+        
+        desc.moov_tracks.push(video_track);
+        desc.moov_tracks.push(gps_track);
+        
+        // Process gaps and edit lists
+        compute_gaps_and_edit_lists(&mut desc).unwrap();
+        
+        let video_track = &desc.moov_tracks[0];
+        let gps_track = &desc.moov_tracks[1];
+        
+        // Both tracks should have edit list entries
+        assert!(!video_track.elst_entries.is_empty(), "Video track should have ELST entries");
+        assert!(!gps_track.elst_entries.is_empty(), "GPS metadata track should have ELST entries");
+        
+        // Video track entries should use video track durations (2s and 3s)
+        assert_eq!(video_track.elst_entries[0].segment_duration, 2000); // 2s file
+        assert_eq!(video_track.elst_entries[2].segment_duration, 3000); // 3s file
+        
+        // GPS track entries should use GPS track durations (1.5s and 2.5s)
+        assert_eq!(gps_track.elst_entries[0].segment_duration, 1500); // 1.5s file  
+        assert_eq!(gps_track.elst_entries[2].segment_duration, 2500); // 2.5s file
+        
+        // Media times should also be track-specific
+        // GPS: first file = 0, second file = 1.5s * 1000 timescale = 1500
+        assert_eq!(gps_track.elst_entries[0].media_time, 0);
+        assert_eq!(gps_track.elst_entries[2].media_time, 1500);
+        
+        // Video: first file = 0, second file = 2s * 30000 timescale = 60000
+        assert_eq!(video_track.elst_entries[0].media_time, 0);
+        assert_eq!(video_track.elst_entries[2].media_time, 60000);
     }
 
     #[test]

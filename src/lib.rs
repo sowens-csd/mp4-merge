@@ -87,6 +87,8 @@ pub fn join_file_streams_with_metadata<F: Fn(f64), I: Read + Seek, O: Read + Wri
     desc.moov_tracks.resize(10, Default::default());
     desc.file_creation_times = file_metadata.to_vec();
     desc.file_durations.resize(files.len(), 0.0);
+    // Initialize track_file_durations[track_index][file_index]
+    desc.track_file_durations.resize(10, vec![0.0; files.len()]);
     let mut total_size = 0;
     let num_files = files.len() as f64;
     let mut insta360_max_read = None;
