@@ -129,7 +129,7 @@ pub fn join_file_streams_with_metadata<F: Fn(f64), I: Read + Seek, O: Read + Wri
             let file_duration_in_movie_timescale = *desc.mvhd_timescale_per_file.get(i).unwrap_or(&desc.moov_mvhd_timescale);
             if file_duration_in_movie_timescale > 0 {
                 // Calculate duration based on the first track (assuming all tracks have similar duration)
-                if let Some(first_track) = desc.moov_tracks.get(0) {
+                if let Some(first_track) = desc.moov_tracks.first() {
                     if first_track.mdhd_timescale > 0 && first_track.mdhd_duration > 0 {
                         desc.file_durations[i] = first_track.mdhd_duration as f64 / first_track.mdhd_timescale as f64;
                         log::debug!("File {} duration: {:.2}s", i, desc.file_durations[i]);

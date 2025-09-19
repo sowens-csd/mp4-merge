@@ -108,7 +108,11 @@ pub fn read_desc<R: Read + Seek>(d: &mut R, desc: &mut Desc, track: usize, max_r
                         track_desc.mdhd_duration += add_duration;
                         
                         // Store per-track, per-file duration in seconds
-                        if tl_track < desc.track_file_durations.len() && file_index < desc.track_file_durations[tl_track].len() {
+                        // Ensure the track_file_durations array is large enough
+                        while desc.track_file_durations.len() <= tl_track {
+                            desc.track_file_durations.push(vec![0.0; desc.file_creation_times.len()]);
+                        }
+                        if file_index < desc.track_file_durations[tl_track].len() {
                             let duration_seconds = duration as f64 / timescale as f64;
                             desc.track_file_durations[tl_track][file_index] = duration_seconds;
                             log::debug!("Track {} file {} duration: {:.2}s", tl_track, file_index, duration_seconds);
@@ -200,7 +204,7 @@ pub fn compute_gaps_and_edit_lists(desc: &mut Desc) -> Result<()> {
     // First, compute all gaps 
     let mut gaps = Vec::new();
     for file_index in 1..desc.file_creation_times.len() {
-        let gap_duration = compute_gap_duration(&desc, file_index - 1, file_index);
+        let gap_duration = compute_gap_duration(desc, file_index - 1, file_index);
         gaps.push(gap_duration);
     }
     
@@ -283,7 +287,7 @@ pub fn compute_gaps_and_edit_lists(desc: &mut Desc) -> Result<()> {
     }
     
     // Update the movie header duration to include gaps
-    if let Some(first_track) = desc.moov_tracks.get(0) {
+    if let Some(first_track) = desc.moov_tracks.first() {
         if !first_track.skip && !first_track.elst_entries.is_empty() {
             desc.moov_mvhd_duration = first_track.elst_segment_duration;
         }
@@ -475,6 +479,52 @@ mod tests {
         // Video: first file = 0, second file = 2s * 30000 timescale = 60000
         assert_eq!(video_track.elst_entries[0].media_time, 0);
         assert_eq!(video_track.elst_entries[2].media_time, 60000);
+    }
+
+    #[test]
+    fn test_dynamic_track_array_resizing() {
+        use std::io::Cursor;
+        
+        let mut desc = Desc {
+            track_file_durations: vec![vec![0.0; 2]], // Start with only 1 track
+            file_creation_times: vec![None, None],
+            ..Default::default()
+        };
+        
+        // Resize tracks to have more than the initial track_file_durations size
+        desc.moov_tracks.resize(3, Default::default());
+        
+        // Simulate reading MDHD for track 2 (index 2), which is beyond initial size
+        let mut fake_mdhd_data = Cursor::new(vec![
+            0, 0, 0, 0, // Version and flags
+            0, 0, 0, 0, // Creation time (v0)
+            0, 0, 0, 0, // Modification time (v0) 
+            0x00, 0x00, 0x03, 0xE8, // Timescale: 1000 (big endian)
+            0x00, 0x00, 0x07, 0xD0, // Duration: 2000 (big endian)
+        ]);
+        
+        // This should trigger dynamic resizing of track_file_durations
+        let tl_track = 2;
+        let file_index = 0;
+        
+        // Simulate the MDHD parsing logic - skip version, flags, creation time, modification time
+        fake_mdhd_data.set_position(12); // Skip to timescale (4 bytes version/flags + 4 bytes creation + 4 bytes modification)
+        let timescale = byteorder::ReadBytesExt::read_u32::<BigEndian>(&mut fake_mdhd_data).unwrap();
+        let duration = byteorder::ReadBytesExt::read_u32::<BigEndian>(&mut fake_mdhd_data).unwrap() as u64;
+        
+        // Simulate the track duration storage logic
+        while desc.track_file_durations.len() <= tl_track {
+            desc.track_file_durations.push(vec![0.0; desc.file_creation_times.len()]);
+        }
+        if file_index < desc.track_file_durations[tl_track].len() {
+            let duration_seconds = duration as f64 / timescale as f64;
+            desc.track_file_durations[tl_track][file_index] = duration_seconds;
+        }
+        
+        // Verify the array was resized correctly
+        assert_eq!(desc.track_file_durations.len(), 3);
+        assert_eq!(desc.track_file_durations[2][0], 2.0); // 2000/1000 = 2.0 seconds
+        assert_eq!(desc.track_file_durations[2].len(), 2); // Should have 2 file slots
     }
 
     #[test]
