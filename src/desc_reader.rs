@@ -180,6 +180,13 @@ pub fn read_desc<R: Read + Seek>(d: &mut R, desc: &mut Desc, track: usize, max_r
                 let handler_type = d.read_u32::<BigEndian>()?;
                 track_desc.handler_type = typ_to_str(handler_type);
                 log::debug!("Track {} handler type: {}", tl_track, track_desc.handler_type);
+                
+                // Check if this is a GPMF metadata track
+                if track_desc.handler_type == "meta" {
+                    // This could be a GPMF metadata track - we'll handle it like other metadata tracks
+                    // but the GPMF module will process the actual GPS data during merging
+                    log::debug!("Found metadata track {} - could contain GPMF data", tl_track);
+                }
             }
             d.seek(SeekFrom::Start(org_pos + size - header_size as u64))?;
         }
@@ -589,5 +596,69 @@ mod tests {
         // Check that tkhd_duration is properly converted to media timescale for GPS track
         // 6s * 1000 GPS timescale = 6000 units
         assert_eq!(gps_track.tkhd_duration, 6000);
+    }
+
+    #[test]
+    fn test_gpmf_metadata_track_handling() {
+        // Test that GPMF metadata tracks are handled correctly by the descriptor reader
+        let mut desc = Desc {
+            moov_mvhd_timescale: 1000,
+            file_creation_times: vec![
+                Some(SystemTime::UNIX_EPOCH), 
+                Some(SystemTime::UNIX_EPOCH + Duration::from_secs(5)) // 5 second gap after 2s file = 3s net gap
+            ],
+            file_durations: vec![2.0, 3.0],
+            ..Default::default()
+        };
+        
+        // Create a video track
+        let video_track = TrackDesc {
+            mdhd_timescale: 30000,
+            handler_type: "vide".to_string(),
+            ..Default::default()
+        };
+        
+        // Create a GPMF metadata track (similar to GPS track but specifically GPMF)
+        let gpmf_track = TrackDesc {
+            mdhd_timescale: 1000, // GPMF metadata typically uses 1000 Hz timescale
+            handler_type: "meta".to_string(), // GPMF uses "meta" handler type
+            ..Default::default()
+        };
+        
+        desc.moov_tracks.push(video_track);
+        desc.moov_tracks.push(gpmf_track);
+        
+        // Process gaps and edit lists
+        compute_gaps_and_edit_lists(&mut desc).unwrap();
+        
+        let video_track = &desc.moov_tracks[0];
+        let gpmf_track = &desc.moov_tracks[1];
+        
+        // Both tracks should have edit list entries
+        assert!(!video_track.elst_entries.is_empty(), "Video track should have ELST entries");
+        assert!(!gpmf_track.elst_entries.is_empty(), "GPMF metadata track should have ELST entries");
+        
+        // Both tracks should have the same total duration in movie timescale
+        // Total: 2s + 3s gap + 3s = 8s = 8000 units in movie timescale
+        assert_eq!(video_track.elst_segment_duration, 8000);
+        assert_eq!(gpmf_track.elst_segment_duration, 8000);
+        
+        // Check GPMF track entries specifically
+        assert_eq!(gpmf_track.elst_entries[0].segment_duration, 2000); // 2s file
+        assert_eq!(gpmf_track.elst_entries[0].media_time, 0); // Start at 0
+        
+        assert_eq!(gpmf_track.elst_entries[1].segment_duration, 3000); // 3s gap
+        assert_eq!(gpmf_track.elst_entries[1].media_time, -1); // Gap entry
+        
+        assert_eq!(gpmf_track.elst_entries[2].segment_duration, 3000); // 3s file
+        assert_eq!(gpmf_track.elst_entries[2].media_time, 2000); // 2s offset in GPMF timescale
+        
+        // Verify handler types are preserved
+        assert_eq!(video_track.handler_type, "vide");
+        assert_eq!(gpmf_track.handler_type, "meta");
+        
+        // Check that tkhd_duration is properly converted to media timescale for GPMF track
+        // 8s * 1000 GPMF timescale = 8000 units
+        assert_eq!(gpmf_track.tkhd_duration, 8000);
     }
 }
