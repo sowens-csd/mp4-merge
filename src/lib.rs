@@ -10,6 +10,7 @@ mod desc_reader;
 mod progress_stream;
 mod writer;
 mod insta360;
+mod gpmf;
 use progress_stream::*;
 
 // We need to:
@@ -92,6 +93,16 @@ pub fn join_file_streams_with_metadata<F: Fn(f64), I: Read + Seek, O: Read + Wri
     let mut total_size = 0;
     let num_files = files.len() as f64;
     let mut insta360_max_read = None;
+    let mut gpmf_detected = false;
+    
+    // Check for GPMF metadata in files
+    if let Ok(gpmf_flags) = gpmf::detect_gpmf_files(files) {
+        gpmf_detected = gpmf_flags.iter().any(|&has_gpmf| has_gpmf);
+        if gpmf_detected {
+            log::debug!("GPMF metadata detected in one or more files");
+        }
+    }
+    
     for (i, fs) in files.iter_mut().enumerate() {
         let filesize = fs.1;
         let mut fs = std::io::BufReader::with_capacity(16*1024, &mut fs.0);
@@ -178,7 +189,12 @@ pub fn join_file_streams_with_metadata<F: Fn(f64), I: Read + Seek, O: Read + Wri
         // Merge Insta360 metadata
         f_out.seek(std::io::SeekFrom::End(0))?;
         let offsets = insta360::get_insta360_offsets(files)?;
-        insta360::merge_metadata(files, &offsets, f_out)?;
+        insta360::merge_metadata(files, &offsets, &mut f_out)?;
+    } else if gpmf_detected {
+        // Merge GPMF metadata (only if no Insta360 metadata)
+        log::debug!("Merging GPMF GPS metadata from {} files", files.len());
+        f_out.seek(std::io::SeekFrom::End(0))?;
+        gpmf::merge_gpmf_metadata(files, &desc.file_durations, &mut f_out)?;
     }
 
     progress_cb(1.0);

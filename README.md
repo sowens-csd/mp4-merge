@@ -7,7 +7,14 @@ This tool can merge all these separate files to a new one without transcoding or
 
 All original tracks are preserved, all metadata is kept as in the original.
 
+**NEW: GoPro GPMF GPS metadata merging support!** When merging GoPro MP4 files, GPS metadata is automatically detected and merged to create a continuous GPS track. See [GPMF_GPS_SUPPORT.md](GPMF_GPS_SUPPORT.md) for details.
+
 It was created to help stabilizing such files in [Gyroflow](https://github.com/gyroflow/gyroflow).
+
+## Supported Metadata Formats
+- **Insta360**: Camera-specific metadata for Insta360 cameras
+- **GoPro GPMF**: GPS and sensor metadata from GoPro cameras (GPS5, GPSU, GYRO, ACCL)
+- **Standard MP4**: All standard MP4 tracks and metadata
 
 ## Download:
 See the [Releases](https://github.com/gyroflow/mp4-merge/releases) page.
